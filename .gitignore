@@ -4,8 +4,6 @@ __pycache__/
 .env
 venv/
 .venv/
-checkpoints/*.pkl
-checkpoints/*.pth
 *.onnx
 *.pt
 .DS_Store
