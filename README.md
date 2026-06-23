@@ -6,14 +6,12 @@ Single-pass inference at up to 1600px resolution with appearance prompt + sharpe
 
 ## Setup
 
-### 1. Download model weights
+### 1. Clone (includes model weights via Git LFS)
 
-Download `docres.pkl` (175MB) and place it in `checkpoints/`:
-
-```
-mkdir -p checkpoints
-# Get the file from the team or internal storage
-cp /path/to/docres.pkl checkpoints/
+```bash
+git lfs install
+git clone git@github.com:posteronework/docres-server.git
+cd docres-server
 ```
 
 ### 2a. Run with Docker (recommended)
@@ -73,7 +71,7 @@ Also works on Apple Silicon (MPS) and CPU (slower).
 ├── models/
 │   └── restormer_arch.py  # Model architecture
 ├── checkpoints/
-│   └── docres.pkl      # Model weights (not in git, see Setup)
+│   └── docres.pkl      # Model weights (Git LFS)
 ├── requirements.txt
 └── Dockerfile
 ```
