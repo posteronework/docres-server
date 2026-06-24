@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DocRes appearance enhancement server — production."""
 
+import asyncio
 import os
 import sys
 import time
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
+from functools import partial
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import Response
 from models.restormer_arch import Restormer
@@ -23,6 +25,8 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX = 30  # requests per window per IP
 rate_limit_store: dict[str, list[float]] = {}
+
+gpu_semaphore = asyncio.Semaphore(1)
 
 
 def check_auth(request: Request):
@@ -225,104 +229,95 @@ def load_model():
     print(f"[server] Models loaded in {time.time()-t0:.1f}s on {DEVICE}")
 
 
-@app.post("/enhance/quality")
-async def enhance_quality(request: Request, file: UploadFile = File(...)):
-    check_auth(request)
-    check_rate_limit(request)
-    t0 = time.time()
-
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
+def _process_enhance(data):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
-        return Response(content="bad image", status_code=400)
-
+        return None
     h, w = img_bgr.shape[:2]
-    t_infer = time.time()
+    t = time.time()
     result = run_model(img_bgr, deshadow_prompt, MAX_DIM)
     result = run_model(result, appearance_prompt, MAX_DIM)
     result = sharpen(result)
-    infer_ms = (time.time() - t_infer) * 1000
-
     _, buf = cv2.imencode(".png", result)
-    total_ms = (time.time() - t0) * 1000
-    print(f"[server] {w}x{h} -> infer {infer_ms:.0f}ms, total {total_ms:.0f}ms")
-
-    return Response(content=buf.tobytes(), media_type="image/png")
+    print(f"[enhance] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    return buf
 
 
-@app.post("/dewarp")
-async def dewarp(request: Request, file: UploadFile = File(...)):
-    check_auth(request)
-    check_rate_limit(request)
-    t0 = time.time()
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
+def _process_dewarp(data):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
-        return Response(content="bad image", status_code=400)
-
+        return None
     h, w = img_bgr.shape[:2]
-    t_infer = time.time()
+    t = time.time()
     result = run_dewarp(img_bgr)
-    infer_ms = (time.time() - t_infer) * 1000
-
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    total_ms = (time.time() - t0) * 1000
-    print(f"[dewarp] {w}x{h} -> infer {infer_ms:.0f}ms, total {total_ms:.0f}ms")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+    print(f"[dewarp] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    return buf
 
 
-@app.post("/full")
-async def full_pipeline(request: Request, file: UploadFile = File(...)):
-    check_auth(request)
-    check_rate_limit(request)
-    t0 = time.time()
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
+def _process_full(data):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
-        return Response(content="bad image", status_code=400)
-
+        return None
     h, w = img_bgr.shape[:2]
-    t_infer = time.time()
+    t = time.time()
     result = run_dewarp(img_bgr)
     result = run_model(result, deshadow_prompt, MAX_DIM)
     result = run_model(result, appearance_prompt, MAX_DIM)
     result = sharpen(result)
-    infer_ms = (time.time() - t_infer) * 1000
-
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    total_ms = (time.time() - t0) * 1000
-    print(f"[full] {w}x{h} -> infer {infer_ms:.0f}ms, total {total_ms:.0f}ms")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+    print(f"[full] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    return buf
+
+
+def _process_deblur(data):
+    img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return None
+    h, w = img_bgr.shape[:2]
+    t = time.time()
+    result = run_model(img_bgr, deblur_prompt, MAX_DIM)
+    result = sharpen(result)
+    _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    print(f"[deblur] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    return buf
+
+
+async def _run_pipeline(request, data, process_fn, media_type):
+    check_auth(request)
+    check_rate_limit(request)
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
+    loop = asyncio.get_event_loop()
+    async with gpu_semaphore:
+        buf = await loop.run_in_executor(None, process_fn, data)
+    if buf is None:
+        return Response(content="bad image", status_code=400)
+    return Response(content=buf.tobytes(), media_type=media_type)
+
+
+@app.post("/enhance/quality")
+async def enhance_quality(request: Request, file: UploadFile = File(...)):
+    data = await file.read()
+    return await _run_pipeline(request, data, _process_enhance, "image/png")
+
+
+@app.post("/dewarp")
+async def dewarp(request: Request, file: UploadFile = File(...)):
+    data = await file.read()
+    return await _run_pipeline(request, data, _process_dewarp, "image/jpeg")
+
+
+@app.post("/full")
+async def full_pipeline(request: Request, file: UploadFile = File(...)):
+    data = await file.read()
+    return await _run_pipeline(request, data, _process_full, "image/jpeg")
 
 
 @app.post("/deblur")
 async def deblur(request: Request, file: UploadFile = File(...)):
-    check_auth(request)
-    check_rate_limit(request)
-    t0 = time.time()
     data = await file.read()
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
-    img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        return Response(content="bad image", status_code=400)
-
-    h, w = img_bgr.shape[:2]
-    t_infer = time.time()
-    result = run_model(img_bgr, deblur_prompt, MAX_DIM)
-    result = sharpen(result)
-    infer_ms = (time.time() - t_infer) * 1000
-
-    _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    total_ms = (time.time() - t0) * 1000
-    print(f"[deblur] {w}x{h} -> infer {infer_ms:.0f}ms, total {total_ms:.0f}ms")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+    return await _run_pipeline(request, data, _process_deblur, "image/jpeg")
 
 
 @app.get("/health")
