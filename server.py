@@ -5,17 +5,17 @@ import asyncio
 import os
 import sys
 import time
+import threading
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
-from functools import partial
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import Response, JSONResponse
 from models.restormer_arch import Restormer
 
-sys.path.insert(0, "mbd")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbd"))
 from model.deep_lab_model.deeplab import DeepLab
 
 app = FastAPI()
@@ -26,7 +26,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}")
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
+        content={"error": "Internal server error"}
     )
 
 API_KEY = os.environ.get("DOCRES_API_KEY", "")
@@ -34,6 +34,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX = 30  # requests per window per IP
 rate_limit_store: dict[str, list[float]] = {}
+rate_limit_lock = threading.Lock()
 
 gpu_semaphore = asyncio.Semaphore(1)
 
@@ -49,15 +50,16 @@ def check_auth(request: Request):
 def check_rate_limit(request: Request):
     ip = request.client.host
     now = time.time()
-    timestamps = rate_limit_store.get(ip, [])
-    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-    if len(timestamps) >= RATE_LIMIT_MAX:
-        raise HTTPException(status_code=429, detail="Too many requests")
-    timestamps.append(now)
-    rate_limit_store[ip] = timestamps
-    stale = [k for k, v in rate_limit_store.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW]
-    for k in stale:
-        del rate_limit_store[k]
+    with rate_limit_lock:
+        timestamps = rate_limit_store.get(ip, [])
+        timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            raise HTTPException(status_code=429, detail="Too many requests")
+        timestamps.append(now)
+        rate_limit_store[ip] = timestamps
+        stale = [k for k, v in rate_limit_store.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW]
+        for k in stale:
+            del rate_limit_store[k]
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -120,17 +122,12 @@ def run_model(img_bgr, prompt_fn, max_dim):
     in_im = np.concatenate((img_bgr, prompt), -1)
     in_im, pad_h, pad_w = stride_integral(in_im, 8)
 
-    in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
+    in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).float().to(DEVICE)
 
     with torch.no_grad():
         pred = model(in_im)
         pred = torch.clamp(pred, 0, 1)
         pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-
-    if DEVICE.type == "mps":
-        torch.mps.empty_cache()
-    elif DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
 
     return pred[pad_h:, pad_w:]
 
@@ -184,23 +181,15 @@ def run_dewarp(img_bgr):
     in_im = torch.cat((img_t, prompt_t), dim=1)
 
     with torch.no_grad():
-        model.float()
         pred = model(in_im)
         pred = pred[0][:2].permute(1, 2, 0).cpu().numpy()
         pred = pred + base_coord
-        model.half()
 
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
     pred = cv2.resize(pred, (w, h)) * (w, h)
     pred = pred.astype(np.float32)
     out = cv2.remap(img_bgr, pred[:, :, 0], pred[:, :, 1], cv2.INTER_LINEAR)
-
-    if DEVICE.type == "mps":
-        torch.mps.empty_cache()
-    elif DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
-
     return out
 
 
@@ -229,7 +218,7 @@ def load_model():
     )
     model.load_state_dict(state)
     model.eval()
-    model = model.half().to(DEVICE)
+    model = model.to(DEVICE)
 
     mbd_model = DeepLab(num_classes=1, backbone='resnet', output_stride=16, sync_bn=None, freeze_bn=False)
     mbd_state = torch.load("checkpoints/mbd.pkl", map_location="cpu")["model_state"]
@@ -299,8 +288,12 @@ async def _run_pipeline(request, data, process_fn, media_type):
     check_auth(request)
     check_rate_limit(request)
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
+    if content_length:
+        try:
+            if int(content_length) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail="File too large")
+        except ValueError:
+            pass
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
     loop = asyncio.get_event_loop()
@@ -337,4 +330,8 @@ async def deblur(request: Request, file: UploadFile = File(...)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": str(DEVICE)}
+    return {
+        "status": "ok",
+        "device": str(DEVICE),
+        "gpu_busy": gpu_semaphore._value == 0,
+    }
