@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DocRes appearance enhancement server — production."""
 
+import os
 import sys
 import time
 import cv2
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import Response
 from models.restormer_arch import Restormer
 
@@ -16,6 +17,31 @@ sys.path.insert(0, "mbd")
 from model.deep_lab_model.deeplab import DeepLab
 
 app = FastAPI()
+
+API_KEY = os.environ.get("DOCRES_API_KEY", "")
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX = 30  # requests per window per IP
+rate_limit_store: dict[str, list[float]] = {}
+
+
+def check_auth(request: Request):
+    if not API_KEY:
+        return
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def check_rate_limit(request: Request):
+    ip = request.client.host
+    now = time.time()
+    timestamps = rate_limit_store.get(ip, [])
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    timestamps.append(now)
+    rate_limit_store[ip] = timestamps
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -200,10 +226,14 @@ def load_model():
 
 
 @app.post("/enhance/quality")
-async def enhance_quality(file: UploadFile = File(...)):
+async def enhance_quality(request: Request, file: UploadFile = File(...)):
+    check_auth(request)
+    check_rate_limit(request)
     t0 = time.time()
 
     data = await file.read()
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return Response(content="bad image", status_code=400)
@@ -223,9 +253,13 @@ async def enhance_quality(file: UploadFile = File(...)):
 
 
 @app.post("/dewarp")
-async def dewarp(file: UploadFile = File(...)):
+async def dewarp(request: Request, file: UploadFile = File(...)):
+    check_auth(request)
+    check_rate_limit(request)
     t0 = time.time()
     data = await file.read()
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return Response(content="bad image", status_code=400)
@@ -242,9 +276,13 @@ async def dewarp(file: UploadFile = File(...)):
 
 
 @app.post("/full")
-async def full_pipeline(file: UploadFile = File(...)):
+async def full_pipeline(request: Request, file: UploadFile = File(...)):
+    check_auth(request)
+    check_rate_limit(request)
     t0 = time.time()
     data = await file.read()
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return Response(content="bad image", status_code=400)
@@ -264,9 +302,13 @@ async def full_pipeline(file: UploadFile = File(...)):
 
 
 @app.post("/deblur")
-async def deblur(file: UploadFile = File(...)):
+async def deblur(request: Request, file: UploadFile = File(...)):
+    check_auth(request)
+    check_rate_limit(request)
     t0 = time.time()
     data = await file.read()
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return Response(content="bad image", status_code=400)
