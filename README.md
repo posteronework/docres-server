@@ -1,8 +1,8 @@
 # DocRes Server
 
-Document appearance enhancement server based on [Restormer](https://arxiv.org/abs/2111.09881).
+Document enhancement server based on [DocRes](https://arxiv.org/abs/2405.04408) (Restormer) + [DeepLab](https://arxiv.org/abs/1706.05587) (MBD).
 
-Single-pass inference at up to 1600px resolution with appearance prompt + sharpening.
+Supports appearance enhancement, deshadowing, dewarping, and deblurring at up to 1600px resolution.
 
 ## Setup
 
@@ -18,7 +18,7 @@ cd docres-server
 
 ```bash
 docker build -t docres .
-docker run -p 8000:8000 --gpus all docres
+docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name docres docres
 ```
 
 ### 2b. Run without Docker
@@ -38,13 +38,13 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 GET /health
 ```
 
-### Enhance document image
+### Endpoints
 
 ```
-POST /v1  — 1 pass, 1024px (fastest)
-POST /v2  — 1 pass, 1600px (recommended)
-POST /v3  — 2 passes, 1024px
-POST /v4  — 2 passes, 1600px (highest quality)
+POST /full              — dewarp + deshadow + appearance + sharpen (full pipeline)
+POST /enhance/quality   — deshadow + appearance + sharpen
+POST /dewarp            — document dewarping only
+POST /deblur            — deblurring + sharpen
 ```
 
 All endpoints accept multipart form data with a `file` field (JPEG/PNG).
@@ -53,25 +53,34 @@ Return enhanced JPEG image.
 Example:
 
 ```bash
-curl -X POST http://localhost:8000/v2 -F "file=@document.jpg" -o enhanced.jpg
+curl -X POST http://localhost:8000/enhance/quality -F "file=@document.jpg" -o enhanced.jpg
 ```
 
 ## Hardware requirements
 
-- **GPU VRAM**: ~2 GB (model weights + inference)
-- **Recommended**: NVIDIA A10 or RTX 4090
-- **Expected latency** (1 pass, 1600px): ~1-2s on A10, ~1.5-2s on 4090
+- **GPU VRAM**: ~2.2 GB (Restormer 183MB + MBD 680MB + inference buffers)
+- **Recommended**: NVIDIA RTX 4090
+- **Expected latency**: /enhance/quality ~1s, /full ~1.2s on RTX 4090
 
 Also works on Apple Silicon (MPS) and CPU (slower).
+
+## Models
+
+| Model | File | Size | Purpose |
+|-------|------|------|---------|
+| DocRes (Restormer) | `checkpoints/docres.pkl` | 183 MB | Appearance, deshadow, deblur, dewarping flow |
+| MBD (DeepLab ResNet) | `checkpoints/mbd.pkl` | 680 MB | Document mask for dewarping |
 
 ## Project structure
 
 ```
-├── server.py           # FastAPI server
+├── server.py              # FastAPI server
 ├── models/
-│   └── restormer_arch.py  # Model architecture
+│   └── restormer_arch.py  # Restormer architecture
+├── mbd/                   # MBD model code (DeepLab)
 ├── checkpoints/
-│   └── docres.pkl      # Model weights (Git LFS)
+│   ├── docres.pkl         # Restormer weights (Git LFS)
+│   └── mbd.pkl            # MBD weights (Git LFS)
 ├── requirements.txt
 └── Dockerfile
 ```
