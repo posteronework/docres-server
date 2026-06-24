@@ -12,13 +12,22 @@ import torch.nn.functional as F
 from collections import OrderedDict
 from functools import partial
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from models.restormer_arch import Restormer
 
 sys.path.insert(0, "mbd")
 from model.deep_lab_model.deeplab import DeepLab
 
 app = FastAPI()
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc)}
+    )
 
 API_KEY = os.environ.get("DOCRES_API_KEY", "")
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
