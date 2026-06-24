@@ -55,6 +55,9 @@ def check_rate_limit(request: Request):
         raise HTTPException(status_code=429, detail="Too many requests")
     timestamps.append(now)
     rate_limit_store[ip] = timestamps
+    stale = [k for k, v in rate_limit_store.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW]
+    for k in stale:
+        del rate_limit_store[k]
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -247,7 +250,7 @@ def _process_enhance(data):
     result = run_model(img_bgr, deshadow_prompt, MAX_DIM)
     result = run_model(result, appearance_prompt, MAX_DIM)
     result = sharpen(result)
-    _, buf = cv2.imencode(".png", result)
+    _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"[enhance] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
     return buf
 
@@ -295,6 +298,9 @@ def _process_deblur(data):
 async def _run_pipeline(request, data, process_fn, media_type):
     check_auth(request)
     check_rate_limit(request)
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
     loop = asyncio.get_event_loop()
@@ -308,7 +314,7 @@ async def _run_pipeline(request, data, process_fn, media_type):
 @app.post("/enhance/quality")
 async def enhance_quality(request: Request, file: UploadFile = File(...)):
     data = await file.read()
-    return await _run_pipeline(request, data, _process_enhance, "image/png")
+    return await _run_pipeline(request, data, _process_enhance, "image/jpeg")
 
 
 @app.post("/dewarp")
