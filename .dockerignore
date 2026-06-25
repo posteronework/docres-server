@@ -1,0 +1,5 @@
+checkpoints/*.pkl
+__pycache__
+*.pyc
+.git
+.gitattributes

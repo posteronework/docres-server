@@ -10,9 +10,9 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from collections import OrderedDict
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import Response, JSONResponse
+from safetensors.torch import load_file
 from models.restormer_arch import Restormer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbd"))
@@ -71,13 +71,6 @@ else:
 MAX_DIM = 1600
 model = None
 mbd_model = None
-
-
-def convert_state_dict(state_dict):
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        new_state_dict[k[7:]] = v
-    return new_state_dict
 
 
 def stride_integral(img, stride=8):
@@ -213,17 +206,12 @@ def load_model():
         heads=[1, 2, 4, 8], ffn_expansion_factor=2.66,
         bias=False, LayerNorm_type="WithBias", dual_pixel_task=True,
     )
-    state = convert_state_dict(
-        torch.load("checkpoints/docres.pkl", map_location="cpu")["model_state"]
-    )
-    model.load_state_dict(state)
+    model.load_state_dict(load_file("checkpoints/docres.safetensors"))
     model.eval()
     model = model.to(DEVICE)
 
     mbd_model = DeepLab(num_classes=1, backbone='resnet', output_stride=16, sync_bn=None, freeze_bn=False)
-    mbd_state = torch.load("checkpoints/mbd.pkl", map_location="cpu")["model_state"]
-    mbd_state = convert_state_dict(mbd_state)
-    mbd_model.load_state_dict(mbd_state)
+    mbd_model.load_state_dict(load_file("checkpoints/mbd.safetensors"))
     mbd_model.eval()
     mbd_model = mbd_model.to(DEVICE)
 

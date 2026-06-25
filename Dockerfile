@@ -1,6 +1,5 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
-ARG TARGETPLATFORM
 WORKDIR /app
 
 COPY requirements.txt .
