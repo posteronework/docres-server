@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """DocRes appearance enhancement server — production."""
 
-import asyncio
+import gc
 import os
 import sys
 import time
@@ -36,9 +36,7 @@ RATE_LIMIT_MAX = 30  # requests per window per IP
 rate_limit_store: dict[str, list[float]] = {}
 rate_limit_lock = threading.Lock()
 
-gpu_semaphore = asyncio.Semaphore(1)
-gpu_queue_count = 0
-GPU_MAX_QUEUE = 5
+gpu_lock = threading.Semaphore(1)
 GPU_QUEUE_TIMEOUT = 60
 
 
@@ -125,6 +123,7 @@ def run_model(img_bgr, prompt_fn, max_dim):
         pred = torch.clamp(pred, 0, 1)
         pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
+    gc.collect()
     torch.cuda.empty_cache()
     return pred[pad_h:, pad_w:]
 
@@ -139,13 +138,14 @@ def get_mask(img_bgr):
     img = cv2.resize(img_bgr, (448, 448))
     img = cv2.GaussianBlur(img, (15, 15), 0, 0)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_t = torch.from_numpy((img.astype(float) / 255.0).transpose(2, 0, 1)).unsqueeze(0).float().to(DEVICE)
+    img_t = torch.from_numpy((img.astype(np.float32) / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
     with torch.no_grad():
         pred = mbd_model(img_t)
         mask = pred[:, 0, :, :].unsqueeze(1)
         mask = F.interpolate(mask, (h, w))
         mask = mask.squeeze(0).squeeze(0).cpu().numpy()
         mask = (mask * 255).astype(np.uint8)
+    gc.collect()
     torch.cuda.empty_cache()
     kernel = np.ones((3, 3))
     mask = cv2.dilate(mask, kernel, iterations=3)
@@ -185,6 +185,7 @@ def run_dewarp(img_bgr):
         pred = pred + base_coord
         model.half()
 
+    gc.collect()
     torch.cuda.empty_cache()
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
@@ -222,7 +223,7 @@ def load_model():
     mbd_model = DeepLab(num_classes=1, backbone='resnet', output_stride=16, sync_bn=None, freeze_bn=False)
     mbd_model.load_state_dict(load_file("checkpoints/mbd.safetensors"))
     mbd_model.eval()
-    mbd_model = mbd_model.to(DEVICE)
+    mbd_model = mbd_model.half().to(DEVICE)
 
     print(f"[server] Models loaded in {time.time()-t0:.1f}s on {DEVICE}")
 
@@ -259,8 +260,7 @@ def _process_full(data):
         return None
     h, w = img_bgr.shape[:2]
     t = time.time()
-    result = run_dewarp(img_bgr)
-    result = run_model(result, deshadow_prompt, MAX_DIM)
+    result = run_model(img_bgr, deshadow_prompt, MAX_DIM)
     result = run_model(result, appearance_prompt, MAX_DIM)
     result = sharpen(result)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -281,8 +281,7 @@ def _process_deblur(data):
     return buf
 
 
-async def _run_pipeline(request, data, process_fn, media_type):
-    global gpu_queue_count
+def _run_pipeline(request, data, process_fn, media_type):
     check_auth(request)
     check_rate_limit(request)
     content_length = request.headers.get("content-length")
@@ -294,45 +293,40 @@ async def _run_pipeline(request, data, process_fn, media_type):
             pass
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
-    if gpu_queue_count >= GPU_MAX_QUEUE:
-        raise HTTPException(status_code=503, detail="Server busy, try again later")
-    gpu_queue_count += 1
-    try:
-        loop = asyncio.get_event_loop()
-        async with asyncio.timeout(GPU_QUEUE_TIMEOUT):
-            async with gpu_semaphore:
-                buf = await loop.run_in_executor(None, process_fn, data)
-    except TimeoutError:
+    acquired = gpu_lock.acquire(timeout=GPU_QUEUE_TIMEOUT)
+    if not acquired:
         raise HTTPException(status_code=504, detail="Queue timeout")
+    try:
+        buf = process_fn(data)
     finally:
-        gpu_queue_count -= 1
+        gpu_lock.release()
     if buf is None:
         return Response(content="bad image", status_code=400)
     return Response(content=buf.tobytes(), media_type=media_type)
 
 
 @app.post("/enhance/quality")
-async def enhance_quality(request: Request, file: UploadFile = File(...)):
-    data = await file.read()
-    return await _run_pipeline(request, data, _process_enhance, "image/jpeg")
+def enhance_quality(request: Request, file: UploadFile = File(...)):
+    data = file.file.read()
+    return _run_pipeline(request, data, _process_enhance, "image/jpeg")
 
 
 @app.post("/dewarp")
-async def dewarp(request: Request, file: UploadFile = File(...)):
-    data = await file.read()
-    return await _run_pipeline(request, data, _process_dewarp, "image/jpeg")
+def dewarp(request: Request, file: UploadFile = File(...)):
+    data = file.file.read()
+    return _run_pipeline(request, data, _process_dewarp, "image/jpeg")
 
 
 @app.post("/full")
-async def full_pipeline(request: Request, file: UploadFile = File(...)):
-    data = await file.read()
-    return await _run_pipeline(request, data, _process_full, "image/jpeg")
+def full_pipeline(request: Request, file: UploadFile = File(...)):
+    data = file.file.read()
+    return _run_pipeline(request, data, _process_full, "image/jpeg")
 
 
 @app.post("/deblur")
-async def deblur(request: Request, file: UploadFile = File(...)):
-    data = await file.read()
-    return await _run_pipeline(request, data, _process_deblur, "image/jpeg")
+def deblur(request: Request, file: UploadFile = File(...)):
+    data = file.file.read()
+    return _run_pipeline(request, data, _process_deblur, "image/jpeg")
 
 
 @app.get("/health")
@@ -340,7 +334,5 @@ def health():
     return {
         "status": "ok",
         "device": str(DEVICE),
-        "gpu_busy": gpu_semaphore._value == 0,
-        "queue": gpu_queue_count,
-        "max_queue": GPU_MAX_QUEUE,
+        "gpu_busy": gpu_lock._value == 0,
     }
