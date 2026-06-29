@@ -68,7 +68,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-MAX_DIM = 1600
+MAX_DIM = 1024
 model = None
 mbd_model = None
 
@@ -122,6 +122,7 @@ def run_model(img_bgr, prompt_fn, max_dim):
         pred = torch.clamp(pred, 0, 1)
         pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
+    torch.cuda.empty_cache()
     return pred[pad_h:, pad_w:]
 
 
@@ -142,6 +143,7 @@ def get_mask(img_bgr):
         mask = F.interpolate(mask, (h, w))
         mask = mask.squeeze(0).squeeze(0).cpu().numpy()
         mask = (mask * 255).astype(np.uint8)
+    torch.cuda.empty_cache()
     kernel = np.ones((3, 3))
     mask = cv2.dilate(mask, kernel, iterations=3)
     mask = cv2.erode(mask, kernel, iterations=3)
@@ -180,6 +182,7 @@ def run_dewarp(img_bgr):
         pred = pred + base_coord
         model.half()
 
+    torch.cuda.empty_cache()
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
     pred = cv2.resize(pred, (w, h)) * (w, h)
