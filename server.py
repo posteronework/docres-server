@@ -299,6 +299,7 @@ def _process_deblur(data):
 
 
 def _run_pipeline(request, data, process_fn, media_type):
+    global gpu_queue_count
     check_auth(request)
     check_rate_limit(request)
     content_length = request.headers.get("content-length")
