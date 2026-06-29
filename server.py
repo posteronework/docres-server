@@ -115,7 +115,7 @@ def run_model(img_bgr, prompt_fn, max_dim):
     in_im = np.concatenate((img_bgr, prompt), -1)
     in_im, pad_h, pad_w = stride_integral(in_im, 8)
 
-    in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).float().to(DEVICE)
+    in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
 
     with torch.no_grad():
         pred = model(in_im)
@@ -174,9 +174,11 @@ def run_dewarp(img_bgr):
     in_im = torch.cat((img_t, prompt_t), dim=1)
 
     with torch.no_grad():
+        model.float()
         pred = model(in_im)
         pred = pred[0][:2].permute(1, 2, 0).cpu().numpy()
         pred = pred + base_coord
+        model.half()
 
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
@@ -208,7 +210,7 @@ def load_model():
     )
     model.load_state_dict(load_file("checkpoints/docres.safetensors"))
     model.eval()
-    model = model.to(DEVICE)
+    model = model.half().to(DEVICE)
 
     mbd_model = DeepLab(num_classes=1, backbone='resnet', output_stride=16, sync_bn=None, freeze_bn=False)
     mbd_model.load_state_dict(load_file("checkpoints/mbd.safetensors"))
