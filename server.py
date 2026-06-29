@@ -76,11 +76,14 @@ model = None
 mbd_model = None
 
 
+GPU_COOLDOWN = 0.15
+
 def _cleanup_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+    time.sleep(GPU_COOLDOWN)
 
 
 def stride_integral(img, stride=8):
@@ -309,7 +312,12 @@ def _run_pipeline(request, data, process_fn, media_type):
         raise HTTPException(status_code=413, detail="File too large")
     with gpu_queue_lock:
         if gpu_queue_count >= GPU_MAX_QUEUE:
-            raise HTTPException(status_code=503, detail="Server busy, try again later")
+            retry_after = gpu_queue_count * 2
+            return JSONResponse(
+                status_code=429,
+                content={"error": "Server busy, try again later"},
+                headers={"Retry-After": str(retry_after)},
+            )
         gpu_queue_count += 1
     try:
         gpu_lock.acquire()
