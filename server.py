@@ -37,6 +37,9 @@ rate_limit_store: dict[str, list[float]] = {}
 rate_limit_lock = threading.Lock()
 
 gpu_semaphore = asyncio.Semaphore(1)
+gpu_queue_count = 0
+GPU_MAX_QUEUE = 5
+GPU_QUEUE_TIMEOUT = 60
 
 
 def check_auth(request: Request):
@@ -279,6 +282,7 @@ def _process_deblur(data):
 
 
 async def _run_pipeline(request, data, process_fn, media_type):
+    global gpu_queue_count
     check_auth(request)
     check_rate_limit(request)
     content_length = request.headers.get("content-length")
@@ -290,9 +294,18 @@ async def _run_pipeline(request, data, process_fn, media_type):
             pass
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
-    loop = asyncio.get_event_loop()
-    async with gpu_semaphore:
-        buf = await loop.run_in_executor(None, process_fn, data)
+    if gpu_queue_count >= GPU_MAX_QUEUE:
+        raise HTTPException(status_code=503, detail="Server busy, try again later")
+    gpu_queue_count += 1
+    try:
+        loop = asyncio.get_event_loop()
+        async with asyncio.timeout(GPU_QUEUE_TIMEOUT):
+            async with gpu_semaphore:
+                buf = await loop.run_in_executor(None, process_fn, data)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="Queue timeout")
+    finally:
+        gpu_queue_count -= 1
     if buf is None:
         return Response(content="bad image", status_code=400)
     return Response(content=buf.tobytes(), media_type=media_type)
@@ -328,4 +341,6 @@ def health():
         "status": "ok",
         "device": str(DEVICE),
         "gpu_busy": gpu_semaphore._value == 0,
+        "queue": gpu_queue_count,
+        "max_queue": GPU_MAX_QUEUE,
     }
