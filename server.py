@@ -188,6 +188,7 @@ def run_dewarp(img_bgr):
     pred = cv2.resize(pred, (w, h)) * (w, h)
     pred = pred.astype(np.float32)
     out = cv2.remap(img_bgr, pred[:, :, 0], pred[:, :, 1], cv2.INTER_LINEAR)
+    out = cv2.resize(out, (w, h))
     return out
 
 
