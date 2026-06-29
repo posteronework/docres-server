@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 import time
+import traceback
 import threading
 import cv2
 import numpy as np
@@ -23,10 +24,16 @@ app = FastAPI()
 
 @app.exception_handler(Exception)
 def global_exception_handler(request: Request, exc: Exception):
-    print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}")
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb)
+    print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}\n{tb_str}")
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error"}
+        content={
+            "error": type(exc).__name__,
+            "detail": str(exc),
+            "traceback": tb_str,
+        }
     )
 
 API_KEY = os.environ.get("DOCRES_API_KEY", "")
