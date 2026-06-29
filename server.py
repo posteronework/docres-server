@@ -22,7 +22,7 @@ app = FastAPI()
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
+def global_exception_handler(request: Request, exc: Exception):
     print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}")
     return JSONResponse(
         status_code=500,
@@ -37,7 +37,9 @@ rate_limit_store: dict[str, list[float]] = {}
 rate_limit_lock = threading.Lock()
 
 gpu_lock = threading.Semaphore(1)
-GPU_QUEUE_TIMEOUT = 60
+gpu_queue_count = 0
+gpu_queue_lock = threading.Lock()
+GPU_MAX_QUEUE = 2
 
 
 def check_auth(request: Request):
@@ -72,6 +74,13 @@ else:
 MAX_DIM = 1024
 model = None
 mbd_model = None
+
+
+def _cleanup_gpu():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def stride_integral(img, stride=8):
@@ -118,13 +127,14 @@ def run_model(img_bgr, prompt_fn, max_dim):
 
     in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
 
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = torch.clamp(pred, 0, 1)
-        pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-
-    gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        with torch.no_grad():
+            pred = model(in_im)
+            pred = torch.clamp(pred, 0, 1)
+            pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    finally:
+        del in_im
+        _cleanup_gpu()
     return pred[pad_h:, pad_w:]
 
 
@@ -139,14 +149,16 @@ def get_mask(img_bgr):
     img = cv2.GaussianBlur(img, (15, 15), 0, 0)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_t = torch.from_numpy((img.astype(np.float32) / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
-    with torch.no_grad():
-        pred = mbd_model(img_t)
-        mask = pred[:, 0, :, :].unsqueeze(1)
-        mask = F.interpolate(mask, (h, w))
-        mask = mask.squeeze(0).squeeze(0).cpu().numpy()
-        mask = (mask * 255).astype(np.uint8)
-    gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        with torch.no_grad():
+            pred = mbd_model(img_t)
+            mask = pred[:, 0, :, :].unsqueeze(1)
+            mask = F.interpolate(mask, (h, w))
+            mask = mask.squeeze(0).squeeze(0).cpu().numpy()
+            mask = (mask * 255).astype(np.uint8)
+    finally:
+        del img_t
+        _cleanup_gpu()
     kernel = np.ones((3, 3))
     mask = cv2.dilate(mask, kernel, iterations=3)
     mask = cv2.erode(mask, kernel, iterations=3)
@@ -178,15 +190,17 @@ def run_dewarp(img_bgr):
 
     in_im = torch.cat((img_t, prompt_t), dim=1)
 
-    with torch.no_grad():
-        model.float()
-        pred = model(in_im)
-        pred = pred[0][:2].permute(1, 2, 0).cpu().numpy()
-        pred = pred + base_coord
+    try:
+        with torch.no_grad():
+            model.float()
+            pred = model(in_im)
+            pred = pred[0][:2].permute(1, 2, 0).cpu().numpy()
+            pred = pred + base_coord
+    finally:
         model.half()
+        del in_im, img_t, prompt_t
+        _cleanup_gpu()
 
-    gc.collect()
-    torch.cuda.empty_cache()
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
     pred = cv2.resize(pred, (w, h)) * (w, h)
@@ -293,13 +307,29 @@ def _run_pipeline(request, data, process_fn, media_type):
             pass
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
-    acquired = gpu_lock.acquire(timeout=GPU_QUEUE_TIMEOUT)
-    if not acquired:
-        raise HTTPException(status_code=504, detail="Queue timeout")
+    with gpu_queue_lock:
+        if gpu_queue_count >= GPU_MAX_QUEUE:
+            raise HTTPException(status_code=503, detail="Server busy, try again later")
+        gpu_queue_count += 1
     try:
-        buf = process_fn(data)
+        gpu_lock.acquire()
+        try:
+            for attempt in range(2):
+                try:
+                    buf = process_fn(data)
+                    break
+                except Exception as e:
+                    _cleanup_gpu()
+                    if attempt == 0:
+                        print(f"[retry] {type(e).__name__}: {e}, retrying...")
+                        continue
+                    raise
+        finally:
+            _cleanup_gpu()
+            gpu_lock.release()
     finally:
-        gpu_lock.release()
+        with gpu_queue_lock:
+            gpu_queue_count -= 1
     if buf is None:
         return Response(content="bad image", status_code=400)
     return Response(content=buf.tobytes(), media_type=media_type)

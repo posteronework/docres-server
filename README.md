@@ -18,7 +18,9 @@ cd docres-server
 
 ```bash
 docker build -t docres .
-docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name docres docres
+docker run -d --gpus all -p 8000:8000 \
+  -e DOCRES_API_KEY="your_secret_key" \
+  --restart unless-stopped --name docres docres
 ```
 
 ### 2b. Run without Docker
@@ -27,16 +29,20 @@ docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name docres doc
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-uvicorn server:app --host 0.0.0.0 --port 8000
+DOCRES_API_KEY="your_secret_key" uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 ## API
+
+All POST endpoints require `Authorization: Bearer <API_KEY>` header.
 
 ### Health check
 
 ```
 GET /health
 ```
+
+Returns `{"status": "ok", "device": "cuda", "gpu_busy": false}`
 
 ### Endpoints
 
@@ -48,17 +54,26 @@ POST /deblur            — deblurring + sharpen
 ```
 
 All endpoints accept multipart form data with a `file` field (JPEG/PNG).
-Return enhanced JPEG image.
+Return enhanced JPEG (quality 95%) image. Max file size: 20MB.
 
 Example:
 
 ```bash
-curl -X POST http://localhost:8000/enhance/quality -F "file=@document.jpg" -o enhanced.jpg
+curl -X POST http://localhost:8000/enhance/quality \
+  -H "Authorization: Bearer your_secret_key" \
+  -F "file=@document.jpg" -o enhanced.jpg
 ```
+
+## Protection
+
+- **API key** — via `DOCRES_API_KEY` env variable, checked in `Authorization: Bearer` header
+- **Rate limiting** — 30 requests/min per IP
+- **File size limit** — 20MB (checked via Content-Length before upload)
+- **GPU queue** — `Semaphore(1)` ensures sequential GPU access, non-blocking event loop
 
 ## Hardware requirements
 
-- **GPU VRAM**: ~2.2 GB (Restormer 183MB + MBD 680MB + inference buffers)
+- **GPU VRAM**: ~1.2 GB (Restormer 58MB + MBD 227MB + inference buffers)
 - **Recommended**: NVIDIA RTX 4090
 - **Expected latency**: /enhance/quality ~1s, /full ~1.2s on RTX 4090
 
@@ -68,8 +83,8 @@ Also works on Apple Silicon (MPS) and CPU (slower).
 
 | Model | File | Size | Purpose |
 |-------|------|------|---------|
-| DocRes (Restormer) | `checkpoints/docres.pkl` | 183 MB | Appearance, deshadow, deblur, dewarping flow |
-| MBD (DeepLab ResNet) | `checkpoints/mbd.pkl` | 680 MB | Document mask for dewarping |
+| DocRes (Restormer) | `checkpoints/docres.safetensors` | 58 MB | Appearance, deshadow, deblur, dewarping flow |
+| MBD (DeepLab ResNet) | `checkpoints/mbd.safetensors` | 227 MB | Document mask for dewarping |
 
 ## Project structure
 
@@ -79,8 +94,9 @@ Also works on Apple Silicon (MPS) and CPU (slower).
 │   └── restormer_arch.py  # Restormer architecture
 ├── mbd/                   # MBD model code (DeepLab)
 ├── checkpoints/
-│   ├── docres.pkl         # Restormer weights (Git LFS)
-│   └── mbd.pkl            # MBD weights (Git LFS)
+│   ├── docres.safetensors # Restormer weights (Git LFS)
+│   └── mbd.safetensors    # MBD weights (Git LFS)
 ├── requirements.txt
-└── Dockerfile
+├── Dockerfile
+└── .dockerignore
 ```
