@@ -1,5 +1,7 @@
 FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 WORKDIR /app
 
 COPY requirements.txt .
