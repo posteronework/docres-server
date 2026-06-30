@@ -46,7 +46,7 @@ rate_limit_lock = threading.Lock()
 gpu_lock = threading.Semaphore(1)
 gpu_queue_count = 0
 gpu_queue_lock = threading.Lock()
-GPU_MAX_QUEUE = 2
+GPU_MAX_QUEUE = 15
 
 
 def check_auth(request: Request):
