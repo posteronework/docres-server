@@ -1,24 +1,29 @@
 #!/bin/bash
-# DocRes server load test
-# Usage: ./loadtest.sh [threads] [connections] [duration]
+# DocRes load test: /full vs /full-dewarp (50/50, resolution=2048, upscale=false)
+# Two runs: sustainable (-c10) then saturation (-c50)
 
-THREADS=${1:-4}
-CONNS=${2:-50}
-DURATION=${3:-60s}
-SERVER="https://docres.s2.aezakmigroup.ru"
+SERVER="https://xtifagasquc4so-8000.proxy.runpod.net"
 IMAGES="../DocRes/input"
 SCRIPT="loadtest.lua"
+DURATION=${1:-60s}
 
-echo "=== DocRes Load Test ==="
-echo "Threads: $THREADS, Connections: $CONNS, Duration: $DURATION"
+echo "=== DocRes Load Test (/full + /full-dewarp @ 2048, upscale=false) ==="
+echo "Server: $SERVER"
+echo "Duration per run: $DURATION"
 echo ""
 
-for ENDPOINT in /enhance/quality /full /deblur; do
-    echo "--- $ENDPOINT ---"
-    wrk -t$THREADS -c$CONNS -d$DURATION \
-        -s $SCRIPT \
-        --timeout 120s \
-        "$SERVER$ENDPOINT" \
-        -- "$IMAGES"
-    echo ""
-done
+echo "########## RUN 1: SUSTAINABLE (-t4 -c10) ##########"
+wrk -t4 -c10 -d$DURATION \
+    -s $SCRIPT \
+    --timeout 120s \
+    "$SERVER" \
+    -- "$IMAGES"
+echo ""
+
+echo "########## RUN 2: SATURATION (-t8 -c50) ##########"
+wrk -t8 -c50 -d$DURATION \
+    -s $SCRIPT \
+    --timeout 120s \
+    "$SERVER" \
+    -- "$IMAGES"
+echo ""
