@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 import time
+import queue
 import traceback
 import threading
 import cv2
@@ -48,10 +49,25 @@ RATE_LIMIT_MAX = 30  # requests per window per IP
 rate_limit_store: dict[str, list[float]] = {}
 rate_limit_lock = threading.Lock()
 
-gpu_lock = threading.Semaphore(1)
 gpu_queue_count = 0
 gpu_queue_lock = threading.Lock()
 GPU_MAX_QUEUE = 15
+
+# Restormer micro-batching
+BATCH_MAX = int(os.environ.get("BATCH_MAX", "6"))
+BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", "0.08"))  # seconds
+heavy_lock = threading.Lock()  # serialize esrgan/geotr GPU stages
+restormer_queue: "queue.Queue" = queue.Queue()
+
+
+class _Job:
+    __slots__ = ("tensor", "result", "error", "event")
+
+    def __init__(self, tensor):
+        self.tensor = tensor  # [1, 6, H, W] half tensor on DEVICE
+        self.result = None    # numpy uint8 HxWx3 (padded H,W)
+        self.error = None
+        self.event = threading.Event()
 
 
 def check_auth(request: Request):
@@ -147,17 +163,87 @@ def run_model(img_bgr, prompt_fn, max_dim):
     in_im = np.concatenate((img_bgr, prompt), -1)
     in_im, pad_h, pad_w = stride_integral(in_im, 8)
 
-    in_im = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
+    in_t = torch.from_numpy((in_im / 255.0).transpose(2, 0, 1)).unsqueeze(0).half().to(DEVICE)
+    pred = restormer_infer(in_t)
+    return pred[pad_h:, pad_w:]
 
+
+def _run_restormer_batch(jobs):
+    """Pad jobs to common H/W, run one forward pass, crop each back."""
+    h_max = max(j.tensor.shape[2] for j in jobs)
+    w_max = max(j.tensor.shape[3] for j in jobs)
+    padded = []
+    for j in jobs:
+        _, _, jh, jw = j.tensor.shape
+        t = F.pad(j.tensor, (0, w_max - jw, 0, h_max - jh), mode="replicate")
+        padded.append(t)
+    big = torch.cat(padded, dim=0)
     try:
         with torch.no_grad():
-            pred = model(in_im)
-            pred = torch.clamp(pred, 0, 1)
-            pred = (pred[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            out = torch.clamp(model(big), 0, 1)
+        for i, j in enumerate(jobs):
+            _, _, jh, jw = j.tensor.shape
+            crop = out[i, :, :jh, :jw]
+            j.result = (crop.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     finally:
-        del in_im
+        del big, padded
         _cleanup_gpu()
-    return pred[pad_h:, pad_w:]
+
+
+def _run_restormer_single(job):
+    try:
+        with torch.no_grad():
+            out = torch.clamp(model(job.tensor), 0, 1)
+        job.result = (out[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    finally:
+        _cleanup_gpu()
+
+
+def restormer_worker():
+    while True:
+        first = restormer_queue.get()
+        batch = [first]
+        deadline = time.time() + BATCH_WINDOW
+        while len(batch) < BATCH_MAX:
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                break
+            try:
+                batch.append(restormer_queue.get(timeout=timeout))
+            except queue.Empty:
+                break
+        try:
+            _run_restormer_batch(batch)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[batch] OOM on batch={len(batch)}, falling back to single")
+                for j in batch:
+                    try:
+                        _run_restormer_single(j)
+                    except Exception as se:
+                        j.error = se
+            else:
+                for j in batch:
+                    j.error = e
+        except Exception as e:
+            for j in batch:
+                j.error = e
+        finally:
+            for j in batch:
+                j.tensor = None
+                j.event.set()
+
+
+def restormer_infer(in_t):
+    job = _Job(in_t)
+    restormer_queue.put(job)
+    if not job.event.wait(timeout=120):
+        raise TimeoutError("Restormer inference timed out")
+    if job.error is not None:
+        raise job.error
+    return job.result
 
 
 def sharpen(img, amount=0.5):
@@ -268,14 +354,15 @@ def geotr_dewarp(img_bgr, expand=0.02):
     im = cv2.resize(im_ori, (288, 288)).transpose(2, 0, 1)
     im = torch.from_numpy(im).unsqueeze(0).to(DEVICE, dtype=dtype)
     try:
-        with torch.no_grad():
-            bm = geotr_model(im, expand=expand).float().cpu()
-            bm0 = cv2.blur(cv2.resize(bm[0, 0].numpy(), (w, h)), (3, 3))
-            bm1 = cv2.blur(cv2.resize(bm[0, 1].numpy(), (w, h)), (3, 3))
-            lbl = torch.from_numpy(np.stack([bm0, bm1], axis=2)).unsqueeze(0).to(DEVICE)
-            src = torch.from_numpy(im_ori.copy()).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
-            out = F.grid_sample(src, lbl, align_corners=True, padding_mode="border")
-            result = ((out[0] * 255).permute(1, 2, 0).cpu().numpy())[:, :, ::-1].astype(np.uint8)
+        with heavy_lock:
+            with torch.no_grad():
+                bm = geotr_model(im, expand=expand).float().cpu()
+                bm0 = cv2.blur(cv2.resize(bm[0, 0].numpy(), (w, h)), (3, 3))
+                bm1 = cv2.blur(cv2.resize(bm[0, 1].numpy(), (w, h)), (3, 3))
+                lbl = torch.from_numpy(np.stack([bm0, bm1], axis=2)).unsqueeze(0).to(DEVICE)
+                src = torch.from_numpy(im_ori.copy()).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+                out = F.grid_sample(src, lbl, align_corners=True, padding_mode="border")
+                result = ((out[0] * 255).permute(1, 2, 0).cpu().numpy())[:, :, ::-1].astype(np.uint8)
     finally:
         del im
         _cleanup_gpu()
@@ -287,8 +374,9 @@ def esrgan_upscale(img_bgr):
     img = torch.from_numpy(img_bgr[:, :, ::-1].copy().transpose(2, 0, 1)).unsqueeze(0) / 255.0
     img = img.to(DEVICE, dtype=dtype)
     try:
-        with torch.no_grad():
-            out = esrgan_model(img)
+        with heavy_lock:
+            with torch.no_grad():
+                out = esrgan_model(img)
         result = (out[0].float().clamp(0, 1).cpu().numpy() * 255).transpose(1, 2, 0)[:, :, ::-1].astype(np.uint8)
     finally:
         del img, out
@@ -339,6 +427,9 @@ def load_model():
         esrgan_model = esrgan_model.half()
 
     print(f"[server] Models loaded in {time.time()-t0:.1f}s on {DEVICE}")
+    t = threading.Thread(target=restormer_worker, daemon=True)
+    t.start()
+    print(f"[server] Restormer batch worker started (BATCH_MAX={BATCH_MAX}, WINDOW={BATCH_WINDOW}s)")
 
 
 def _process_enhance(data, max_dim=MAX_DIM):
@@ -475,21 +566,16 @@ def _run_pipeline(request, data, process_fn, media_type, max_dim=MAX_DIM):
             )
         gpu_queue_count += 1
     try:
-        gpu_lock.acquire()
-        try:
-            for attempt in range(2):
-                try:
-                    buf = process_fn(data, max_dim)
-                    break
-                except Exception as e:
-                    _cleanup_gpu(full=True)
-                    if attempt == 0:
-                        print(f"[retry] {type(e).__name__}: {e}, retrying...")
-                        continue
-                    raise
-        finally:
-            _cleanup_gpu(full=True)
-            gpu_lock.release()
+        for attempt in range(2):
+            try:
+                buf = process_fn(data, max_dim)
+                break
+            except Exception as e:
+                _cleanup_gpu(full=True)
+                if attempt == 0:
+                    print(f"[retry] {type(e).__name__}: {e}, retrying...")
+                    continue
+                raise
     finally:
         with gpu_queue_lock:
             gpu_queue_count -= 1
@@ -541,5 +627,6 @@ def health():
     return {
         "status": "ok",
         "device": str(DEVICE),
-        "gpu_busy": gpu_lock._value == 0,
+        "gpu_busy": gpu_queue_count > 0,
+        "queue": gpu_queue_count,
     }
