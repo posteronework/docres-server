@@ -25,5 +25,9 @@ ls -lh checkpoints/
 echo "[start] installing deps (torch/torchvision come from base image)..."
 pip install --no-cache-dir -r requirements.txt
 
-echo "[start] launching server on port ${PORT} ..."
-exec uvicorn server:app --host 0.0.0.0 --port "${PORT}" --workers 1
+echo "[start] launching server on port ${PORT} (auto-restart on crash) ..."
+while true; do
+  uvicorn server:app --host 0.0.0.0 --port "${PORT}" --workers 1 || true
+  echo "[start] server exited (code $?), restarting in 3s..."
+  sleep 3
+done
