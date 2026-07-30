@@ -372,8 +372,35 @@ def _process_full(data, max_dim=MAX_DIM, upscale=True):
     if img_bgr is None:
         return None
     h, w = img_bgr.shape[:2]
-    t = time.time()
-    t0 = t
+    t0 = time.time()
+    used_esrgan = False
+    if upscale and max(h, w) < ESRGAN_MIN_DIM:
+        img_bgr = esrgan_upscale(img_bgr)
+        used_esrgan = True
+    t_esrgan = time.time()
+    result = run_model(img_bgr, deshadow_prompt, max_dim)
+    t_deshadow = time.time()
+    result = run_model(result, appearance_prompt, max_dim)
+    t_appearance = time.time()
+    result = sharpen(result)
+    _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    t_end = time.time()
+    print(
+        f"[full] {w}x{h} @ {max_dim} -> {(t_end-t0)*1000:.0f}ms | "
+        f"esrgan={'%.0f' % ((t_esrgan-t0)*1000) if used_esrgan else 'skip'}ms "
+        f"deshadow={(t_deshadow-t_esrgan)*1000:.0f}ms "
+        f"appearance={(t_appearance-t_deshadow)*1000:.0f}ms "
+        f"encode={(t_end-t_appearance)*1000:.0f}ms"
+    )
+    return buf
+
+
+def _process_full_dewarp(data, max_dim=MAX_DIM, upscale=True):
+    img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return None
+    h, w = img_bgr.shape[:2]
+    t0 = time.time()
     used_esrgan = False
     if upscale and max(h, w) < ESRGAN_MIN_DIM:
         img_bgr = esrgan_upscale(img_bgr)
@@ -389,7 +416,7 @@ def _process_full(data, max_dim=MAX_DIM, upscale=True):
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
     t_end = time.time()
     print(
-        f"[full] {w}x{h} @ {max_dim} -> {(t_end-t0)*1000:.0f}ms | "
+        f"[full-dewarp] {w}x{h} @ {max_dim} -> {(t_end-t0)*1000:.0f}ms | "
         f"esrgan={'%.0f' % ((t_esrgan-t0)*1000) if used_esrgan else 'skip'}ms "
         f"geotr={(t_geotr-t_esrgan)*1000:.0f}ms "
         f"deshadow={(t_deshadow-t_geotr)*1000:.0f}ms "
@@ -490,6 +517,15 @@ def full_pipeline(request: Request, file: UploadFile = File(...)):
     upscale = request.query_params.get("upscale", "true").lower() != "false"
     data = file.file.read()
     process_fn = lambda d, m: _process_full(d, m, upscale)
+    return _run_pipeline(request, data, process_fn, "image/jpeg", max_dim)
+
+
+@app.post("/full-dewarp")
+def full_dewarp_pipeline(request: Request, file: UploadFile = File(...)):
+    max_dim = _parse_resolution(request)
+    upscale = request.query_params.get("upscale", "true").lower() != "false"
+    data = file.file.read()
+    process_fn = lambda d, m: _process_full_dewarp(d, m, upscale)
     return _run_pipeline(request, data, process_fn, "image/jpeg", max_dim)
 
 
