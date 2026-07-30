@@ -367,7 +367,7 @@ def _process_dewarp(data, max_dim=MAX_DIM):
     return buf
 
 
-def _process_full(data, max_dim=MAX_DIM):
+def _process_full(data, max_dim=MAX_DIM, upscale=True):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return None
@@ -375,7 +375,7 @@ def _process_full(data, max_dim=MAX_DIM):
     t = time.time()
     t0 = t
     used_esrgan = False
-    if max(h, w) < ESRGAN_MIN_DIM:
+    if upscale and max(h, w) < ESRGAN_MIN_DIM:
         img_bgr = esrgan_upscale(img_bgr)
         used_esrgan = True
     t_esrgan = time.time()
@@ -487,8 +487,10 @@ def dewarp(request: Request, file: UploadFile = File(...)):
 @app.post("/full")
 def full_pipeline(request: Request, file: UploadFile = File(...)):
     max_dim = _parse_resolution(request)
+    upscale = request.query_params.get("upscale", "true").lower() != "false"
     data = file.file.read()
-    return _run_pipeline(request, data, _process_full, "image/jpeg", max_dim)
+    process_fn = lambda d, m: _process_full(d, m, upscale)
+    return _run_pipeline(request, data, process_fn, "image/jpeg", max_dim)
 
 
 @app.post("/deblur")
