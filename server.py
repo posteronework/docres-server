@@ -469,9 +469,7 @@ def _process_full(data, max_dim=MAX_DIM, upscale=True):
         img_bgr = esrgan_upscale(img_bgr)
         used_esrgan = True
     t_esrgan = time.time()
-    result = run_model(img_bgr, deshadow_prompt, max_dim)
-    t_deshadow = time.time()
-    result = run_model(result, appearance_prompt, max_dim)
+    result = run_model(img_bgr, appearance_prompt, max_dim)
     t_appearance = time.time()
     result = sharpen(result)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -479,8 +477,7 @@ def _process_full(data, max_dim=MAX_DIM, upscale=True):
     print(
         f"[full] {w}x{h} @ {max_dim} -> {(t_end-t0)*1000:.0f}ms | "
         f"esrgan={'%.0f' % ((t_esrgan-t0)*1000) if used_esrgan else 'skip'}ms "
-        f"deshadow={(t_deshadow-t_esrgan)*1000:.0f}ms "
-        f"appearance={(t_appearance-t_deshadow)*1000:.0f}ms "
+        f"appearance={(t_appearance-t_esrgan)*1000:.0f}ms "
         f"encode={(t_end-t_appearance)*1000:.0f}ms"
     )
     return buf
