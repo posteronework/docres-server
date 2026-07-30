@@ -260,47 +260,34 @@ class GeoTr_Seg(torch.nn.Module):
 
 
 def geotr_dewarp(img_bgr, expand=0.02):
+    dtype = next(geotr_model.parameters()).dtype
     im_ori = img_bgr[:, :, ::-1] / 255.0
     h, w, _ = im_ori.shape
     im = cv2.resize(im_ori, (288, 288)).transpose(2, 0, 1)
-    im = torch.from_numpy(im).float().unsqueeze(0).to(DEVICE)
+    im = torch.from_numpy(im).unsqueeze(0).to(DEVICE, dtype=dtype)
     try:
         with torch.no_grad():
-            bm = geotr_model(im, expand=expand).cpu()
-        bm0 = cv2.blur(cv2.resize(bm[0, 0].numpy(), (w, h)), (3, 3))
-        bm1 = cv2.blur(cv2.resize(bm[0, 1].numpy(), (w, h)), (3, 3))
-        lbl = torch.from_numpy(np.stack([bm0, bm1], axis=2)).unsqueeze(0)
-        src = torch.from_numpy(im_ori.copy()).permute(2, 0, 1).unsqueeze(0).float()
-        out = F.grid_sample(src, lbl, align_corners=True, padding_mode="border")
+            bm = geotr_model(im, expand=expand).float().cpu()
+            bm0 = cv2.blur(cv2.resize(bm[0, 0].numpy(), (w, h)), (3, 3))
+            bm1 = cv2.blur(cv2.resize(bm[0, 1].numpy(), (w, h)), (3, 3))
+            lbl = torch.from_numpy(np.stack([bm0, bm1], axis=2)).unsqueeze(0).to(DEVICE)
+            src = torch.from_numpy(im_ori.copy()).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+            out = F.grid_sample(src, lbl, align_corners=True, padding_mode="border")
+            result = ((out[0] * 255).permute(1, 2, 0).cpu().numpy())[:, :, ::-1].astype(np.uint8)
     finally:
         del im
         _cleanup_gpu()
-    return ((out[0] * 255).permute(1, 2, 0).numpy())[:, :, ::-1].astype(np.uint8)
+    return result
 
 
-def esrgan_upscale(img_bgr, tile=256):
-    h, w = img_bgr.shape[:2]
-    scale = 2
-    img = torch.from_numpy(img_bgr[:, :, ::-1].copy().transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
-    img = img.to(DEVICE)
-    out = torch.zeros(1, 3, h * scale, w * scale, device=DEVICE)
-    pad = 16
+def esrgan_upscale(img_bgr):
+    dtype = next(esrgan_model.parameters()).dtype
+    img = torch.from_numpy(img_bgr[:, :, ::-1].copy().transpose(2, 0, 1)).unsqueeze(0) / 255.0
+    img = img.to(DEVICE, dtype=dtype)
     try:
         with torch.no_grad():
-            for y in range(0, h, tile):
-                for x in range(0, w, tile):
-                    y2 = min(y + tile, h)
-                    x2 = min(x + tile, w)
-                    ys = max(y - pad, 0)
-                    xs = max(x - pad, 0)
-                    ye = min(y2 + pad, h)
-                    xe = min(x2 + pad, w)
-                    op = esrgan_model(img[:, :, ys:ye, xs:xe])
-                    oy = (y - ys) * scale
-                    ox = (x - xs) * scale
-                    out[:, :, y * scale:y2 * scale, x * scale:x2 * scale] = \
-                        op[:, :, oy:oy + (y2 - y) * scale, ox:ox + (x2 - x) * scale]
-        result = (out[0].clamp(0, 1).cpu().numpy() * 255).transpose(1, 2, 0)[:, :, ::-1].astype(np.uint8)
+            out = esrgan_model(img)
+        result = (out[0].float().clamp(0, 1).cpu().numpy() * 255).transpose(1, 2, 0)[:, :, ::-1].astype(np.uint8)
     finally:
         del img, out
         _cleanup_gpu()
@@ -338,14 +325,18 @@ def load_model():
     _load_prefixed(geotr_model.msk, "checkpoints/seg.pth", 6)
     _load_prefixed(geotr_model.GeoTr, "checkpoints/geotr.pth", 7)
     geotr_model.eval()
-    geotr_model = geotr_model.float().to(DEVICE)
+    geotr_model = geotr_model.to(DEVICE)
+    if DEVICE.type == "cuda":
+        geotr_model = geotr_model.half()
 
     esrgan_model = RRDBNet(scale=2)
     esr_sd = torch.load("checkpoints/esrgan_x2.pth", map_location="cpu")
     esr_sd = esr_sd.get("params_ema", esr_sd.get("params", esr_sd))
     esrgan_model.load_state_dict(esr_sd, strict=True)
     esrgan_model.eval()
-    esrgan_model = esrgan_model.float().to(DEVICE)
+    esrgan_model = esrgan_model.to(DEVICE)
+    if DEVICE.type == "cuda":
+        esrgan_model = esrgan_model.half()
 
     print(f"[server] Models loaded in {time.time()-t0:.1f}s on {DEVICE}")
 
