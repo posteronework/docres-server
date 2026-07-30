@@ -95,12 +95,14 @@ esrgan_model = None
 
 GPU_COOLDOWN = 0.15
 
-def _cleanup_gpu():
-    gc.collect()
+def _cleanup_gpu(full=False):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    time.sleep(GPU_COOLDOWN)
+    if full:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        time.sleep(GPU_COOLDOWN)
 
 
 def stride_integral(img, stride=8):
@@ -453,13 +455,13 @@ def _run_pipeline(request, data, process_fn, media_type, max_dim=MAX_DIM):
                     buf = process_fn(data, max_dim)
                     break
                 except Exception as e:
-                    _cleanup_gpu()
+                    _cleanup_gpu(full=True)
                     if attempt == 0:
                         print(f"[retry] {type(e).__name__}: {e}, retrying...")
                         continue
                     raise
         finally:
-            _cleanup_gpu()
+            _cleanup_gpu(full=True)
             gpu_lock.release()
     finally:
         with gpu_queue_lock:
