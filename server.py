@@ -45,7 +45,7 @@ def global_exception_handler(request: Request, exc: Exception):
 API_KEY = os.environ.get("DOCRES_API_KEY", "")
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX = 100000  # TEMP: raised for load test (prod=30), restore after NT
+RATE_LIMIT_MAX = 30  # requests per window per IP
 rate_limit_store: dict[str, list[float]] = {}
 rate_limit_lock = threading.Lock()
 
