@@ -51,7 +51,7 @@ rate_limit_lock = threading.Lock()
 
 gpu_queue_count = 0
 gpu_queue_lock = threading.Lock()
-GPU_MAX_QUEUE = 15
+GPU_MAX_QUEUE = int(os.environ.get("GPU_MAX_QUEUE", "40"))
 
 # Restormer micro-batching
 BATCH_MAX = int(os.environ.get("BATCH_MAX", "6"))
