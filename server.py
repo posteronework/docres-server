@@ -250,7 +250,7 @@ class GeoTr_Seg(torch.nn.Module):
 
     def forward(self, x, expand=0.0):
         msk, _1, _2, _3, _4, _5, _6 = self.msk(x)
-        msk = (msk > 0.5).float()
+        msk = (msk > 0.5).to(x.dtype)
         x = msk * x
         bm = self.GeoTr(x)
         bm = (2 * (bm / 286.8) - 1) * 0.99
@@ -325,9 +325,7 @@ def load_model():
     _load_prefixed(geotr_model.msk, "checkpoints/seg.pth", 6)
     _load_prefixed(geotr_model.GeoTr, "checkpoints/geotr.pth", 7)
     geotr_model.eval()
-    geotr_model = geotr_model.to(DEVICE)
-    if DEVICE.type == "cuda":
-        geotr_model = geotr_model.half()
+    geotr_model = geotr_model.float().to(DEVICE)
 
     esrgan_model = RRDBNet(scale=2)
     esr_sd = torch.load("checkpoints/esrgan_x2.pth", map_location="cpu")
