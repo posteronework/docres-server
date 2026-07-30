@@ -15,9 +15,14 @@ from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import Response, JSONResponse
 from safetensors.torch import load_file
 from models.restormer_arch import Restormer
+from models.rrdbnet import RRDBNet
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbd"))
 from model.deep_lab_model.deeplab import DeepLab
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "geotr"))
+from GeoTr import GeoTr
+from seg import U2NETP
 
 app = FastAPI()
 
@@ -79,8 +84,13 @@ else:
     DEVICE = torch.device("cpu")
 
 MAX_DIM = 1024
+ALLOWED_RESOLUTIONS = {512, 768, 1024, 1600, 2048}
+DEFAULT_RESOLUTION = 2048
+ESRGAN_MIN_DIM = 1500
 model = None
 mbd_model = None
+geotr_model = None
+esrgan_model = None
 
 
 GPU_COOLDOWN = 0.15
@@ -170,7 +180,7 @@ def get_mask(img_bgr):
         del img_t
         _cleanup_gpu()
     kernel = np.ones((3, 3))
-    mask = cv2.dilate(mask, kernel, iterations=3)
+    mask = cv2.dilate(mask, kernel, iterations=15)
     mask = cv2.erode(mask, kernel, iterations=3)
     mask[mask > 100] = 255
     mask[mask < 100] = 0
@@ -213,6 +223,8 @@ def run_dewarp(img_bgr):
 
     for _ in range(15):
         pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
+    margin = 0.04
+    pred = pred * (1 - 2 * margin) + margin
     pred = cv2.resize(pred, (w, h)) * (w, h)
     pred = pred.astype(np.float32)
     out = cv2.remap(img_bgr, pred[:, :, 0], pred[:, :, 1], cv2.INTER_LINEAR)
@@ -230,9 +242,82 @@ def deblur_prompt(img):
     return cv2.cvtColor(hf, cv2.COLOR_GRAY2BGR)
 
 
+class GeoTr_Seg(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.msk = U2NETP(3, 1)
+        self.GeoTr = GeoTr(num_attn_layers=6)
+
+    def forward(self, x, expand=0.0):
+        msk, _1, _2, _3, _4, _5, _6 = self.msk(x)
+        msk = (msk > 0.5).float()
+        x = msk * x
+        bm = self.GeoTr(x)
+        bm = (2 * (bm / 286.8) - 1) * 0.99
+        if expand > 0:
+            bm = bm * (1 + 2 * expand)
+        return bm
+
+
+def geotr_dewarp(img_bgr, expand=0.02):
+    im_ori = img_bgr[:, :, ::-1] / 255.0
+    h, w, _ = im_ori.shape
+    im = cv2.resize(im_ori, (288, 288)).transpose(2, 0, 1)
+    im = torch.from_numpy(im).float().unsqueeze(0).to(DEVICE)
+    try:
+        with torch.no_grad():
+            bm = geotr_model(im, expand=expand).cpu()
+        bm0 = cv2.blur(cv2.resize(bm[0, 0].numpy(), (w, h)), (3, 3))
+        bm1 = cv2.blur(cv2.resize(bm[0, 1].numpy(), (w, h)), (3, 3))
+        lbl = torch.from_numpy(np.stack([bm0, bm1], axis=2)).unsqueeze(0)
+        src = torch.from_numpy(im_ori.copy()).permute(2, 0, 1).unsqueeze(0).float()
+        out = F.grid_sample(src, lbl, align_corners=True, padding_mode="border")
+    finally:
+        del im
+        _cleanup_gpu()
+    return ((out[0] * 255).permute(1, 2, 0).numpy())[:, :, ::-1].astype(np.uint8)
+
+
+def esrgan_upscale(img_bgr, tile=256):
+    h, w = img_bgr.shape[:2]
+    scale = 2
+    img = torch.from_numpy(img_bgr[:, :, ::-1].copy().transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+    img = img.to(DEVICE)
+    out = torch.zeros(1, 3, h * scale, w * scale, device=DEVICE)
+    pad = 16
+    try:
+        with torch.no_grad():
+            for y in range(0, h, tile):
+                for x in range(0, w, tile):
+                    y2 = min(y + tile, h)
+                    x2 = min(x + tile, w)
+                    ys = max(y - pad, 0)
+                    xs = max(x - pad, 0)
+                    ye = min(y2 + pad, h)
+                    xe = min(x2 + pad, w)
+                    op = esrgan_model(img[:, :, ys:ye, xs:xe])
+                    oy = (y - ys) * scale
+                    ox = (x - xs) * scale
+                    out[:, :, y * scale:y2 * scale, x * scale:x2 * scale] = \
+                        op[:, :, oy:oy + (y2 - y) * scale, ox:ox + (x2 - x) * scale]
+        result = (out[0].clamp(0, 1).cpu().numpy() * 255).transpose(1, 2, 0)[:, :, ::-1].astype(np.uint8)
+    finally:
+        del img, out
+        _cleanup_gpu()
+    return result
+
+
+def _load_prefixed(module, path, prefix_len):
+    md = module.state_dict()
+    pd = torch.load(path, map_location="cpu")
+    pd = {k[prefix_len:]: v for k, v in pd.items() if k[prefix_len:] in md}
+    md.update(pd)
+    module.load_state_dict(md)
+
+
 @app.on_event("startup")
 def load_model():
-    global model, mbd_model
+    global model, mbd_model, geotr_model, esrgan_model
     t0 = time.time()
     model = Restormer(
         inp_channels=6, out_channels=3, dim=48,
@@ -249,63 +334,92 @@ def load_model():
     mbd_model.eval()
     mbd_model = mbd_model.half().to(DEVICE)
 
+    geotr_model = GeoTr_Seg()
+    _load_prefixed(geotr_model.msk, "checkpoints/seg.pth", 6)
+    _load_prefixed(geotr_model.GeoTr, "checkpoints/geotr.pth", 7)
+    geotr_model.eval()
+    geotr_model = geotr_model.float().to(DEVICE)
+
+    esrgan_model = RRDBNet(scale=2)
+    esr_sd = torch.load("checkpoints/esrgan_x2.pth", map_location="cpu")
+    esr_sd = esr_sd.get("params_ema", esr_sd.get("params", esr_sd))
+    esrgan_model.load_state_dict(esr_sd, strict=True)
+    esrgan_model.eval()
+    esrgan_model = esrgan_model.float().to(DEVICE)
+
     print(f"[server] Models loaded in {time.time()-t0:.1f}s on {DEVICE}")
 
 
-def _process_enhance(data):
+def _process_enhance(data, max_dim=MAX_DIM):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return None
     h, w = img_bgr.shape[:2]
     t = time.time()
-    result = run_model(img_bgr, deshadow_prompt, MAX_DIM)
-    result = run_model(result, appearance_prompt, MAX_DIM)
+    result = run_model(img_bgr, deshadow_prompt, max_dim)
+    result = run_model(result, appearance_prompt, max_dim)
     result = sharpen(result)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    print(f"[enhance] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    print(f"[enhance] {w}x{h} @ {max_dim} -> {(time.time()-t)*1000:.0f}ms")
     return buf
 
 
-def _process_dewarp(data):
+def _process_dewarp(data, max_dim=MAX_DIM):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return None
     h, w = img_bgr.shape[:2]
     t = time.time()
-    result = run_dewarp(img_bgr)
+    result = geotr_dewarp(img_bgr)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"[dewarp] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
     return buf
 
 
-def _process_full(data):
+def _process_full(data, max_dim=MAX_DIM):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return None
     h, w = img_bgr.shape[:2]
     t = time.time()
-    result = run_model(img_bgr, deshadow_prompt, MAX_DIM)
-    result = run_model(result, appearance_prompt, MAX_DIM)
+    if max(h, w) < ESRGAN_MIN_DIM:
+        img_bgr = esrgan_upscale(img_bgr)
+    img_bgr = geotr_dewarp(img_bgr)
+    result = run_model(img_bgr, deshadow_prompt, max_dim)
+    result = run_model(result, appearance_prompt, max_dim)
     result = sharpen(result)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    print(f"[full] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    print(f"[full] {w}x{h} @ {max_dim} -> {(time.time()-t)*1000:.0f}ms")
     return buf
 
 
-def _process_deblur(data):
+def _process_deblur(data, max_dim=MAX_DIM):
     img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         return None
     h, w = img_bgr.shape[:2]
     t = time.time()
-    result = run_model(img_bgr, deblur_prompt, MAX_DIM)
+    result = run_model(img_bgr, deblur_prompt, max_dim)
     result = sharpen(result)
     _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    print(f"[deblur] {w}x{h} -> {(time.time()-t)*1000:.0f}ms")
+    print(f"[deblur] {w}x{h} @ {max_dim} -> {(time.time()-t)*1000:.0f}ms")
     return buf
 
 
-def _run_pipeline(request, data, process_fn, media_type):
+def _parse_resolution(request):
+    raw = request.query_params.get("resolution")
+    if raw is None:
+        return DEFAULT_RESOLUTION
+    try:
+        val = int(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid resolution")
+    if val not in ALLOWED_RESOLUTIONS:
+        raise HTTPException(status_code=400, detail=f"resolution must be one of {sorted(ALLOWED_RESOLUTIONS)}")
+    return val
+
+
+def _run_pipeline(request, data, process_fn, media_type, max_dim=MAX_DIM):
     global gpu_queue_count
     check_auth(request)
     check_rate_limit(request)
@@ -332,7 +446,7 @@ def _run_pipeline(request, data, process_fn, media_type):
         try:
             for attempt in range(2):
                 try:
-                    buf = process_fn(data)
+                    buf = process_fn(data, max_dim)
                     break
                 except Exception as e:
                     _cleanup_gpu()
@@ -353,8 +467,9 @@ def _run_pipeline(request, data, process_fn, media_type):
 
 @app.post("/enhance/quality")
 def enhance_quality(request: Request, file: UploadFile = File(...)):
+    max_dim = _parse_resolution(request)
     data = file.file.read()
-    return _run_pipeline(request, data, _process_enhance, "image/jpeg")
+    return _run_pipeline(request, data, _process_enhance, "image/jpeg", max_dim)
 
 
 @app.post("/dewarp")
@@ -365,14 +480,16 @@ def dewarp(request: Request, file: UploadFile = File(...)):
 
 @app.post("/full")
 def full_pipeline(request: Request, file: UploadFile = File(...)):
+    max_dim = _parse_resolution(request)
     data = file.file.read()
-    return _run_pipeline(request, data, _process_full, "image/jpeg")
+    return _run_pipeline(request, data, _process_full, "image/jpeg", max_dim)
 
 
 @app.post("/deblur")
 def deblur(request: Request, file: UploadFile = File(...)):
+    max_dim = _parse_resolution(request)
     data = file.file.read()
-    return _run_pipeline(request, data, _process_deblur, "image/jpeg")
+    return _run_pipeline(request, data, _process_deblur, "image/jpeg", max_dim)
 
 
 @app.get("/health")

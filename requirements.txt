@@ -5,3 +5,4 @@ uvicorn==0.39.0
 python-multipart==0.0.20
 einops==0.8.2
 safetensors==0.5.3
+torchvision==0.21.0

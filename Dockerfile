@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY models/ models/
 COPY mbd/ mbd/
+COPY geotr/ geotr/
 COPY checkpoints/ checkpoints/
 COPY server.py .
 
